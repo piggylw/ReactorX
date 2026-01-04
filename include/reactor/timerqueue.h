@@ -52,7 +52,10 @@ private:
     const int m_timerfd; // timerfd 文件描述符
     TimerSet m_timers; // 定时器集合，按到期时间排序
     std::unique_ptr<Channel> m_timerfdChannel; // timerfd 的 Channel
-    std::set<Timer*> m_cancellingTimers; // 正在取消的定时器集合
+
+    //在回调中取消其他同时到期的定时器
+    //防止重复定时器被重新插入
+    std::set<Timer*> m_cancellingTimers;
 
 };
 

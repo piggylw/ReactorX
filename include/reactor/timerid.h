@@ -21,6 +21,9 @@ public:
     TimerId() : m_timer(nullptr), m_sequence(0) {}
     TimerId(Timer* timer, int64_t sequence)
         : m_timer(timer), m_sequence(sequence) {}
+    
+    Timer* timer() const { return m_timer; }
+    int64_t sequence() const { return m_sequence; }
         
 private:
     Timer* m_timer; // 指向定时器对象的指针
