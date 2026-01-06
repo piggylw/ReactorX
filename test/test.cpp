@@ -1,24 +1,39 @@
 #include "reactor/eventloop.h"
 #include "reactor/channel.h"
+#include "reactor/eventloopthreadpool.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <cstring>
 #include <iostream>
-#include <memory>
 #include <map>
+#include <memory>
+#include <atomic>
 
 using namespace reactor;
 
-// 创建监听socket
+// 全局统计
+std::atomic<int> g_totalConnections{0};
+std::atomic<int64_t> g_totalBytesRead{0};
+std::atomic<int64_t> g_totalBytesWritten{0};
+
+struct Connection {
+    int fd;
+    EventLoop* loop;
+    std::unique_ptr<Channel> channel;
+    
+    Connection(EventLoop* l, int sockfd) 
+        : fd(sockfd), loop(l), channel(new Channel(l, sockfd)) {}
+};
+
+// 每个线程的连接管理器（无需加锁）
+thread_local std::map<int, std::shared_ptr<Connection>> t_connections;
+
 int createListenSocket(uint16_t port)
 {
     int listenfd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (listenfd < 0) {
-        std::cerr << "socket() failed" << std::endl;
-        abort();
-    }
+    if (listenfd < 0) abort();
 
     int optval = 1;
     ::setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
@@ -29,36 +44,14 @@ int createListenSocket(uint16_t port)
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
 
-    if (::bind(listenfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        std::cerr << "bind() failed" << std::endl;
-        abort();
-    }
-
-    if (::listen(listenfd, 128) < 0) {
-        std::cerr << "listen() failed" << std::endl;
-        abort();
-    }
+    if (::bind(listenfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) abort();
+    if (::listen(listenfd, 128) < 0) abort();
 
     std::cout << "Server listening on 0.0.0.0:" << port << std::endl;
     return listenfd;
 }
 
-// 连接管理结构（简化版，不是完整的TcpConnection）
-struct Connection {
-    int fd;
-    std::unique_ptr<Channel> channel;
-    
-    Connection(EventLoop* loop, int sockfd) 
-        : fd(sockfd), channel(new Channel(loop, sockfd)) 
-    {
-    }
-};
-
-// 全局连接管理器（使用智能指针）
-std::map<int, std::shared_ptr<Connection>> g_connections;
-
-// 接受新连接的回调
-void onNewConnection(EventLoop* loop, int listenfd)
+void onNewConnection(EventLoopThreadPool* pool, int listenfd)
 {
     struct sockaddr_in peerAddr;
     socklen_t addrLen = sizeof(peerAddr);
@@ -66,105 +59,107 @@ void onNewConnection(EventLoop* loop, int listenfd)
     int connfd = ::accept4(listenfd, (struct sockaddr*)&peerAddr, &addrLen,
                            SOCK_NONBLOCK | SOCK_CLOEXEC);
     
-    if (connfd < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            std::cerr << "accept4() failed: " << strerror(errno) << std::endl;
-        }
-        return;
-    }
+    if (connfd < 0) return;
 
     char buf[32];
     ::inet_ntop(AF_INET, &peerAddr.sin_addr, buf, sizeof(buf));
     std::cout << "New connection from " << buf << ":" << ntohs(peerAddr.sin_port) 
               << " fd=" << connfd << std::endl;
 
-    // 使用shared_ptr管理连接
-    auto conn = std::make_shared<Connection>(loop, connfd);
-
-    // 设置读回调：echo逻辑
-    conn->channel->setReadCallback([conn]() {
-        char buf[1024];
-        ssize_t n = ::read(conn->fd, buf, sizeof(buf));
+    // 获取下一个EventLoop（负载均衡）
+    EventLoop* ioLoop = pool->getNextLoop();
+    
+    // 在选定的Loop线程执行连接初始化
+    ioLoop->runInLoop([ioLoop, connfd]() {
+        // 此时已在ioLoop线程
+        auto conn = std::make_shared<Connection>(ioLoop, connfd);
         
-        if (n > 0) {
-            std::cout << "Read " << n << " bytes from fd=" << conn->fd << std::endl;
+        conn->channel->setReadCallback([conn]() {
+            char buf[4096];
+            ssize_t n = ::read(conn->fd, buf, sizeof(buf));
             
-            // Echo back
-            ssize_t nw = ::write(conn->fd, buf, n);
-            if (nw < 0) {
-                std::cerr << "write() error: " << strerror(errno) << std::endl;
-            }
-        } else if (n == 0) {
-            // 对端关闭连接
-            std::cout << "Connection closed by peer, fd=" << conn->fd << std::endl;
-            
-            // 关闭连接
-            conn->channel->disableAll();
-            conn->channel->remove();
-            ::close(conn->fd);
-            
-            // 从管理器中移除（shared_ptr自动释放内存）
-            g_connections.erase(conn->fd);
-        } else {
-            // 出错
-            if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                std::cerr << "read() error: " << strerror(errno) << std::endl;
+            if (n > 0) {
+                g_totalBytesRead.fetch_add(n);
+                
+                // Echo back
+                ssize_t nw = ::write(conn->fd, buf, n);
+                if (nw > 0) {
+                    g_totalBytesWritten.fetch_add(nw);
+                }
+            } else if (n == 0) {
+                std::cout << "[Thread " << tid() << "] "
+                          << "Connection closed, fd=" << conn->fd << std::endl;
                 
                 conn->channel->disableAll();
                 conn->channel->remove();
                 ::close(conn->fd);
-                g_connections.erase(conn->fd);
+                t_connections.erase(conn->fd);
+                
+                g_totalConnections.fetch_sub(1);
+            } else {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    std::cerr << "read error: " << strerror(errno) << std::endl;
+                    
+                    conn->channel->disableAll();
+                    conn->channel->remove();
+                    ::close(conn->fd);
+                    t_connections.erase(conn->fd);
+                    
+                    g_totalConnections.fetch_sub(1);
+                }
             }
-        }
+        });
+        
+        conn->channel->enableReading();
+        t_connections[connfd] = conn;
+        
+        g_totalConnections.fetch_add(1);
     });
-
-    // 设置关闭回调
-    conn->channel->setCloseCallback([conn]() {
-        std::cout << "Connection closed, fd=" << conn->fd << std::endl;
-        conn->channel->disableAll();
-        conn->channel->remove();
-        ::close(conn->fd);
-        g_connections.erase(conn->fd);
-    });
-
-    // 设置错误回调
-    conn->channel->setErrorCallback([conn]() {
-        std::cerr << "Connection error, fd=" << conn->fd << std::endl;
-        conn->channel->disableAll();
-        conn->channel->remove();
-        ::close(conn->fd);
-        g_connections.erase(conn->fd);
-    });
-
-    // 启用读事件
-    conn->channel->enableReading();
-    
-    // 加入连接管理器
-    g_connections[connfd] = conn;
 }
 
-int main()
+void printStatistics()
 {
-    std::cout << "=== Reactor Day2 Test: Echo Server (Multiple Connections) ===" << std::endl;
+    std::cout << "\n=== Statistics ===" << std::endl;
+    std::cout << "Connections: " << g_totalConnections.load() << std::endl;
+    std::cout << "Total read: " << g_totalBytesRead.load() << " bytes" << std::endl;
+    std::cout << "Total written: " << g_totalBytesWritten.load() << " bytes" << std::endl;
+    std::cout << "==================\n" << std::endl;
+}
 
-    EventLoop loop;
+int main(int argc, char* argv[])
+{
+    int numThreads = 4;
+    if (argc > 1) {
+        numThreads = atoi(argv[1]);
+    }
 
-    int listenfd = createListenSocket(9981);
+    std::cout << "Multi-threaded Echo Server ===" << std::endl;
+    std::cout << "Thread pool size: " << numThreads << std::endl;
+
+    EventLoop loop;  // 主Loop（Acceptor）
+    
+    // 创建线程池
+    EventLoopThreadPool pool(&loop);
+    pool.setThreadNum(numThreads);
+    pool.start();
+
+    int listenfd = createListenSocket(9983);
 
     Channel listenChannel(&loop, listenfd);
-    
-    listenChannel.setReadCallback([&loop, listenfd]() {
-        onNewConnection(&loop, listenfd);
+    listenChannel.setReadCallback([&pool, listenfd]() {
+        onNewConnection(&pool, listenfd);
     });
-
     listenChannel.enableReading();
 
-    std::cout << "EventLoop starting..." << std::endl;
-    std::cout << "Use: telnet localhost 9981 or nc localhost 9981" << std::endl;
-    
+    // 定期打印统计信息
+    loop.runEvery(5.0, printStatistics);
+
+    std::cout << "\nServer started. Use:\n"
+              << "  Single client: nc localhost 9983\n"
+              << std::endl;
+
     loop.loop();
 
     ::close(listenfd);
-    
     return 0;
 }

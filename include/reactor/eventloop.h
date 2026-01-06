@@ -3,9 +3,11 @@
 #include "noncopyable.h"
 #include "currentthread.h"
 #include "timerid.h"
+#include "callbacks.h"
 #include <memory>
 #include <vector>
 #include <atomic>
+#include <mutex>
 
 namespace reactor {
 
@@ -27,7 +29,7 @@ class Timestamp;
 class EventLoop : private NonCopyable
 {
 public:
-    EventLoop();
+    explicit EventLoop();
     ~EventLoop();
 
     void loop(); // 启动事件循环
@@ -51,6 +53,8 @@ public:
     // 如果在Loop线程调用，直接执行
     // 如果在其他线程调用，加入队列
     void runInLoop(Functor cb);
+    void queueInLoop(Functor cb);
+    void wakeup();
 
     // 判断当前线程是否是Loop线程
     bool isInLoopThread() const
@@ -72,14 +76,22 @@ public:
 
 private:
     void abortNotInLoopThread();
+    void handleReadForWakeupFd(); //处理wakeupfd读事件
+    void doPendingFunctors();
+
     using ChannelList = std::vector<Channel*>;
 
     std::atomic<bool> m_isLooping; // 是否正在循环中
     std::atomic<bool> m_quit; // 是否退出循环
+    std::atomic<bool> m_callingPendingFunctors;
     const pid_t m_threadId; // 创建 EventLoop 的线程 ID
     std::unique_ptr<Poller> m_poller; // Poller 实例
     std::unique_ptr<TimerQueue> m_timerQueue; // TimerQueue 实例
     ChannelList m_activeChannels; // 活跃的 Channel 列表
+    int m_wakeupFd; //eventfd
+    std::unique_ptr<Channel> m_wakeupChannle;
+    std::mutex m_mtx;
+    std::vector<Functor> m_pendingFactors;
 };
 
 }

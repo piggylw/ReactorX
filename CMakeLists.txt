@@ -16,6 +16,9 @@ set(REACTOR_SRCS
     src/poller.cpp
     src/channel.cpp
     src/eventloop.cpp
+    src/timestamp.cpp      
+    src/timer.cpp          
+    src/timerqueue.cpp     
 )
 
 # 生成静态库
