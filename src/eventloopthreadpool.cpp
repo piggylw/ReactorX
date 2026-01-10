@@ -12,6 +12,11 @@ EventLoopThreadPool::EventLoopThreadPool(EventLoop* baseloop)
       m_next(0)
 {}
 
+EventLoopThreadPool::~EventLoopThreadPool()
+{
+    
+}
+
 void EventLoopThreadPool::start()
 {
     assert(!m_started);

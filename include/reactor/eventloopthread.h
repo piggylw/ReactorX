@@ -40,6 +40,6 @@ private:
     std::thread m_thread;
     std::mutex m_mtx;
     std::condition_variable m_cond;
-}
+};
 
 }

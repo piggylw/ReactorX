@@ -31,12 +31,12 @@ class EventLoopThreadPool : private NonCopyable
 {
 public:
     explicit EventLoopThreadPool(EventLoop* baseloop);
-    ~EventLoopThreadPool() {}
+    ~EventLoopThreadPool();
 
      // 设置线程数（必须在start()前调用）
     void setThreadNum(int nums) { m_threadNums = nums; }
     void start();
-    EventLoop* getNextLoop();
+    EventLoop* getNextLoop();  //TODO实现负载均衡
     std::vector<EventLoop*> getAllLoops();
     bool started() const { return m_started; }
 
@@ -47,6 +47,6 @@ private:
     int m_next;
     std::vector<std::unique_ptr<EventLoopThread>> m_pool;
     std::vector<EventLoop*> m_loops;
-}
+};
 
 }
